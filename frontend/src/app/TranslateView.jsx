@@ -8,7 +8,8 @@ import { glossaryById, needsReview as segNeedsReview } from '../lib/api'
 import { findTermSpans } from '../lib/termMatch'
 import { canSpeak, useSpeaker } from '../lib/speech'
 import { canDictate, useDictation } from '../lib/dictation'
-import { TypeChip, Flag, Confidence, LEVEL, LEVEL_HINT, TYPE, highlight, LtrBrackets } from './ui'
+import { useLang } from '../lib/i18n'
+import { TypeChip, Flag, Confidence, VerifiedRetrieval, LEVEL, LEVEL_HINT, TYPE, highlight, LtrBrackets } from './ui'
 
 const AUDIENCES = [
   ['general_non_muslim', 'غير مسلم (عام)'],
@@ -330,7 +331,7 @@ function Segment({ s, i, lang, speaking, onSpeak }) {
           <span className="rounded-full bg-paper px-[0.55rem] py-[0.12rem] text-[0.7rem] font-bold text-ink-600" title={LEVEL_HINT[s.level]}>المستوى ({LEVEL[s.level]})</span>
           {needsReview && <span className="inline-flex items-center gap-[0.25rem] rounded-full bg-danger-bg px-[0.55rem] py-[0.12rem] text-[0.7rem] font-bold text-danger-fg"><UserCheck className="h-[0.8rem] w-[0.8rem]" aria-hidden /> محال للمراجعة</span>}
         </div>
-        {!needsReview && <Confidence value={s.confidence} />}
+        {s.verification === 'verified_retrieval' ? <VerifiedRetrieval /> : !needsReview && <Confidence value={s.confidence} />}
       </div>
 
       <div dir="ltr" className="grid grid-cols-1 gap-[0.6rem] p-[1rem] md:grid-cols-[1fr_auto_1fr] md:items-start">
@@ -346,7 +347,9 @@ function Segment({ s, i, lang, speaking, onSpeak }) {
                   </button>
                 )}
               </div>
-            : <p dir="rtl" className="text-[0.86rem] leading-[1.5rem] text-ink-600">{s.confidence == null ? 'الترجمة تظهر عند ربط الخادم.' : 'لم يُترجَم هذا المقطع، وأُحيل إلى المراجع.'}</p>}
+            : s.verification === 'ambiguous_verse' && s.candidates.length > 0
+            ? <VerseCandidates candidates={s.candidates} lang={lang} />
+            : <p dir={dir} className="text-[0.86rem] leading-[1.5rem] text-ink-600">{s.confidence == null ? tr('الترجمة تظهر عند ربط الخادم.', 'The translation appears once the server is connected.') : tr('لم يُترجَم هذا المقطع، وأُحيل إلى المراجع.', 'This segment was not translated and was sent to the reviewer.')}</p>}
         </div>
         <ArrowLeft className="order-2 mx-auto hidden h-[1.1rem] w-[1.1rem] text-brand-600 md:mt-[0.9rem] md:block" aria-hidden />
         <ArrowDown className="order-2 mx-auto h-[1rem] w-[1rem] text-brand-600 md:hidden" aria-hidden />
@@ -373,6 +376,32 @@ function Segment({ s, i, lang, speaking, onSpeak }) {
         </div>
       )}
     </li>
+  )
+}
+
+// A quote found in several verses (server `verification: ambiguous_verse`, D-076): no place
+// was chosen, so every place is listed with its approved translation for the reviewer.
+function VerseCandidates({ candidates, lang }) {
+  const { t: tr, dir } = useLang()
+  return (
+    <div dir={dir} className="space-y-[0.5rem] text-[0.86rem] leading-[1.5rem] text-ink-600">
+      <p className="font-bold text-ink-900">{tr('هذا النص موجود في أكثر من موضع:', 'This text appears in more than one place:')}</p>
+      <ul className="max-h-[18rem] space-y-[0.5rem] overflow-y-auto">
+        {candidates.map((c) => (
+          <li key={c.ref} className="rounded-[0.6rem] bg-[#F6F8FA] p-[0.6rem]">
+            <b className="tabular text-ink-900">{c.ref}</b>
+            <p dir="rtl" className="font-quran text-[1.02rem] leading-[1.9rem] text-ink-900">﴿{c.ar}﴾</p>
+            {c[lang] && (
+              <p dir="ltr" className="latin text-left text-ink-900">
+                <LtrBrackets>{`﴿${c[lang]}﴾`}</LtrBrackets>
+                {c[`${lang}_edition`] && <span className="ms-[0.3rem] text-[0.74rem] text-ink-600">({c[`${lang}_edition`]})</span>}
+              </p>
+            )}
+          </li>
+        ))}
+      </ul>
+      <p>{tr('لم نعتمد أيًّا من هذه المواضع، وأُحيل المقطع إلى المراجع الشرعي لتحديد الموضع.', 'None of these places was chosen; the segment was sent to the Sharia reviewer to pick the right one.')}</p>
+    </div>
   )
 }
 

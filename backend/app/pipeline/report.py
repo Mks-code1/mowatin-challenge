@@ -7,7 +7,7 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
-from app.schemas import Flag, Segment, SegmentFlag, Summary, TranslateResponse
+from app.schemas import VERIFIED_RETRIEVAL, Flag, Segment, SegmentFlag, Summary, TranslateResponse
 
 MESSAGES_PATH = Path(__file__).resolve().parents[3] / "data" / "messages" / "flags.ar.json"
 
@@ -18,7 +18,12 @@ REVIEW_THRESHOLD = 0.75
 DISCLOSURE = "مخرجات مدعومة بالذكاء الاصطناعي، وتحتاج مراجعة بشرية مؤهلة قبل النشر."
 
 # Flags whose `detail` is the value of a single placeholder in their message.
-_SINGLE_PLACEHOLDER = {"hadith_fabricated": "ruling", "term_check_failed": "term"}
+_SINGLE_PLACEHOLDER = {
+    "hadith_fabricated": "ruling",
+    "term_check_failed": "term",
+    "quran_ambiguous": "refs",
+    "quran_context_resolved": "ref",
+}
 
 _UNFILLED_RE = re.compile(r"\{[a-z_]+\}")
 
@@ -50,8 +55,6 @@ def _placeholders(flag: Flag) -> dict[str, str]:
     if flag.key == "quran_diacritized":
         ref, _, verse = flag.detail.partition("|")
         return {"ref": ref, "verse": verse}
-    if flag.key == "quran_ambiguous":
-        return {"refs": flag.detail, "ref": flag.detail.split(",")[0].strip()}
     if flag.key in ("avoid_word_found", "compare_why_term"):
         term, _, word = flag.detail.partition("|")
         return {"term": term, "word": word}
@@ -90,13 +93,26 @@ def needs_review(segment: Segment) -> bool:
     return low or any(f.severity != "info" for f in segment.flags)
 
 
+def average_confidence(segments: list[Segment]) -> float | None:
+    """Mean confidence of the segments that have a verifier-style score (D-076).
+
+    A verified retrieval (a verse read verbatim from the approved translation) has no LLM
+    output to score, so it is left out instead of counted: it can neither pull the mean
+    down nor lift it. ``None`` when every segment is one; 0.0 when there are no segments.
+    """
+    if not segments:
+        return 0.0
+    scored = [s.confidence for s in segments if s.verification != VERIFIED_RETRIEVAL]
+    return round(sum(scored) / len(scored), 2) if scored else None
+
+
 def assemble(segments: list[Segment]) -> TranslateResponse:
     """Build the contract response (summary + review queue + disclosure) from finished segments."""
     queue = [s.id for s in segments if needs_review(s)]
-    avg = sum(s.confidence for s in segments) / len(segments) if segments else 0.0
+    avg = average_confidence(segments)
     return TranslateResponse(
         segments=segments,
-        summary=Summary(segments=len(segments), flagged=len(queue), avg_confidence=round(avg, 2)),
+        summary=Summary(segments=len(segments), flagged=len(queue), avg_confidence=avg),
         review_queue=queue,
         disclosure=DISCLOSURE,
     )

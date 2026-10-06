@@ -15,17 +15,26 @@ const TABS = [
   ['review', 'لوحة المراجع', ShieldCheck],
 ]
 
-const REASON = { quran: 'آية لا تطابق النص المعتمد', hadith: 'قول بلا مصدر معتمد', fatwa_like: 'حالة شخصية تتطلب فتوى', term_heavy: 'ثقة منخفضة في مصطلح', general: 'ثقة منخفضة' }
-const TITLE = { quran: 'آية قرآنية', hadith: 'حديث نبوي', fatwa_like: 'سؤال شخصي', term_heavy: 'مصطلح شرعي', general: 'نص عام' }
+// [Arabic, English]; queue items keep both so the reviewer panel follows the interface language.
+const REASON = {
+  quran: ['آية لا تطابق النص المعتمد', 'Verse does not match the authoritative text'],
+  hadith: ['قول بلا مصدر معتمد', 'Saying with no authoritative source'],
+  fatwa_like: ['حالة شخصية تتطلب فتوى', 'Personal case that needs a fatwa'],
+  term_heavy: ['ثقة منخفضة في مصطلح', 'Low confidence in a term'],
+  general: ['ثقة منخفضة', 'Low confidence'],
+}
+// A quote found in several verses: not a mismatch, the place is unknown (D-076).
+const AMBIGUOUS_REASON = ['نص يرد في أكثر من موضع من القرآن', 'Text found in more than one place in the Quran']
+const TITLE = { quran: ['آية قرآنية', 'Quran verse'], hadith: ['حديث نبوي', 'Hadith'], fatwa_like: ['سؤال شخصي', 'Personal question'], term_heavy: ['مصطلح شرعي', 'Islamic term'], general: ['نص عام', 'General text'] }
 
 // Only translated segments (confidence set) reach the reviewer; detection-only
 // results have nothing to approve.
 function toQueueItems(segments, lang, queueIds) {
   const flagged = queueIds ? (s) => queueIds.includes(s.id) : needsReview
   return segments.filter((s) => s.confidence != null && flagged(s)).map((s) => ({
-    id: `${lang}:${s.source}`, type: s.type, lang, source: s.source, proposed: s.output, ref: s.sources[0]?.ref,
-    flags: s.flags, title: `${TITLE[s.type]} · ${s.source.replace(/^(قال الله تعالى|وقال النبي ﷺ|قال النبي ﷺ):?\s*/, '').slice(0, 34)}`,
-    reason: REASON[s.type], status: 'pending', reviewerNote: '',
+    id: `${lang}:${s.source}`, type: s.type, lang, source: s.source, proposed: s.output, ref: s.sources[0]?.ref ?? s.candidates?.map((c) => c.ref).join('، '),
+    flags: s.flags, title: TITLE[s.type] ?? TITLE.general, snippet: s.source.replace(/^(قال الله تعالى|وقال النبي ﷺ|قال النبي ﷺ):?\s*/, '').slice(0, 34),
+    reason: s.verification === 'ambiguous_verse' ? AMBIGUOUS_REASON : REASON[s.type] ?? REASON.general, status: 'pending', reviewerNote: '',
   }))
 }
 

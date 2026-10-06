@@ -2,12 +2,15 @@ import json
 import logging
 import math
 import re
+import unicodedata
+from collections.abc import Sequence
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 from app.pipeline.classifier import QURAN_ATTRIBUTIONS
 from app.pipeline.normalize import canonicalize_for_matching, normalize_text
-from app.schemas import Flag, SourceRef
+from app.schemas import AMBIGUOUS_VERSE, VERIFIED_RETRIEVAL, Flag, SourceRef, VerseCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +150,31 @@ class QuranIndex:
     def find_words(self, words: list[str]) -> list[tuple[int, int]]:
         """Verse ranges where ``words`` occur in order as whole words."""
         return [self.verse_range(span) for span in self.word_spans(words)]
+
+    def joined_spans(self, words: list[str]) -> list[tuple[int, int]]:
+        """Spans where ``words`` occur with spaces ignored, starting and ending on whole Quran
+        words: «ياايها» for «يا ايها». A fallback for when the word match finds nothing."""
+        text, starts, ends = self._joined_text()
+        query, all_words, spans = "".join(words), self._words(), []
+        pos = text.find(query) if query else -1
+        while pos != -1:
+            first, last = starts.get(pos), ends.get(pos + len(query))
+            if first is not None and last is not None:
+                spans.append((all_words[first][0], all_words[last][1]))
+            pos = text.find(query, pos + 1)
+        return spans
+
+    def _joined_text(self) -> tuple[str, dict[int, int], dict[int, int]]:
+        """``giant_string`` without spaces, with word number by first and by end character."""
+        if not hasattr(self, "_joined"):
+            parts, starts, ends, pos = [], {}, {}, 0
+            for n, (start, end) in enumerate(self._words()):
+                starts[pos] = n
+                pos += end - start
+                ends[pos] = n
+                parts.append(self.giant_string[start:end])
+            self._joined = ("".join(parts), starts, ends)
+        return self._joined
 
     def word_spans(self, words: list[str]) -> list[tuple[int, int]]:
         """Spans of ``giant_string`` where ``words`` occur in order as whole words."""
@@ -388,34 +416,215 @@ def _not_found() -> dict:
     return {"output": None, "sources": [], "flags": flags, "review": True}
 
 
+# A quote under this share of its verse is not enough to insert it (D-006 as built).
+MIN_VERSE_SHARE = 0.1
+# Under this share the whole verse's translation is inserted but reviewed (D-055, D-006's 40%).
+PARTIAL_REVIEW_SHARE = 0.4
+
+
+@dataclass(frozen=True)
+class QuoteContext:
+    """The segment's text before and after the quote, used only to tell apart the places of
+    a quote found in several verses."""
+
+    before: str = ""
+    after: str = ""
+
+
 def _from_exact(
-    idx: QuranIndex, spans: list[tuple[int, int]], matched_chars: int, lang: str
+    idx: QuranIndex,
+    spans: list[tuple[int, int]],
+    matched_chars: int,
+    lang: str,
+    context: QuoteContext | None = None,
 ) -> dict:
-    """Approved translation of the first exact match; a quote under 10% of its verse is not enough.
+    """Approved translation of an exact match found in one place (D-055 adds the review cases).
 
-    A single match also gets its words with Tanzil's tashkeel (D-044); an ambiguous one does not.
+    Found in several verses: the segment's own context may leave exactly one (D-076);
+    otherwise no place is chosen and every place is returned for review. Not inserted: a
+    quote under ``MIN_VERSE_SHARE`` of its verse, or under ``UNBRACKETED_MIN_WORDS`` words
+    unless it is a whole verse («مدهامتان»). Reviewed: a quote under ``PARTIAL_REVIEW_SHARE``
+    of its verse (the whole verse is inserted). The verse found also gets its words with
+    Tanzil's tashkeel (D-044).
     """
-    matches = [idx.verse_range(span) for span in spans]
-    v_start, v_end = matches[0]
-    flags = []
-    if len(matches) > 1:
-        refs = [f"{idx.verses[s]['ref']}" for s, _e in matches]
-        flags.append(Flag(type="info", key="quran_ambiguous", detail=", ".join(refs)))
-
-    total_verse_chars = sum(len(idx.verses[i]["norm"]) for i in range(v_start, v_end + 1))
-    total_verse_chars += v_end - v_start
-    ratio = matched_chars / total_verse_chars if total_verse_chars > 0 else 0
-    if ratio < 0.1:
-        flags.append(Flag(type="warn", key="quran_not_found"))
-        return {"output": None, "sources": [], "flags": flags, "review": True}
+    spans = _one_span_per_place(idx, _without_sura_openings(idx, spans))
+    short = len(idx.giant_string[spans[0][0] : spans[0][1]].split()) < UNBRACKETED_MIN_WORDS
+    if short and not any(idx.is_whole_verse(span) for span in spans):
+        return _not_found()
+    flags: list[Flag] = []
+    if len(spans) > 1:
+        narrowed = _narrow_by_context(idx, spans, context or QuoteContext())
+        if len(narrowed) != 1:
+            return _ambiguous(idx, spans)
+        spans = narrowed
+        ref = _ref(idx, *idx.verse_range(spans[0]))
+        flags.append(Flag(type="info", key="quran_context_resolved", detail=ref))
+    v_start, v_end = idx.verse_range(spans[0])
+    share = _verse_share(idx, v_start, v_end, matched_chars)
+    if share < MIN_VERSE_SHARE or (short and not idx.is_whole_verse(spans[0])):
+        return _not_found()
 
     output, sources, found_flags = _insert_translation(idx, lang, v_start, v_end)
     flags += found_flags
     if output is not None:
         flags.append(Flag(type="info", key="quran_from_approved"))
-    if len(spans) == 1:
-        flags += _diacritized_flags(idx, spans[0])
-    return {"output": output, "sources": sources, "flags": flags, "review": False}
+    if output is not None and share < PARTIAL_REVIEW_SHARE:
+        flags.append(Flag(type="warn", key="quran_partial"))
+    flags += _diacritized_flags(idx, spans[0])
+    result = {"output": output, "sources": sources, "flags": flags, "review": _reviewed(flags)}
+    if output is not None:
+        # One place, its translation read verbatim from the approved edition (D-076).
+        result["verification"] = VERIFIED_RETRIEVAL
+    return result
+
+
+def _one_span_per_place(idx: QuranIndex, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """A quote found twice inside the same verse is still one place."""
+    seen: dict[tuple[int, int], tuple[int, int]] = {}
+    for span in spans:
+        seen.setdefault(idx.verse_range(span), span)
+    return list(seen.values())
+
+
+def _ambiguous(idx: QuranIndex, spans: list[tuple[int, int]]) -> dict:
+    """A quote found in several places (D-076): no place is chosen, so no translation is
+    inserted; every place, with its text and approved translations, goes to review."""
+    places = [idx.verse_range(span) for span in spans]
+    refs = ", ".join(_ref(idx, start, end) for start, end in places)
+    return {
+        "output": None,
+        "sources": [],
+        "flags": [Flag(type="warn", key="quran_ambiguous", detail=refs)],
+        "review": True,
+        "verification": AMBIGUOUS_VERSE,
+        "candidates": [_candidate(idx, start, end) for start, end in places],
+    }
+
+
+def _candidate(idx: QuranIndex, v_start: int, v_end: int) -> VerseCandidate:
+    """One place of an ambiguous quote: its Arabic text (with Tanzil's tashkeel when it
+    aligns) and its approved English and French translations, never generated text."""
+    arabic = " ".join(
+        idx.diacritized_verse(v) or idx.verses[v]["text"] for v in range(v_start, v_end + 1)
+    )
+    en, en_edition = idx.get_translation("en", v_start, v_end)
+    fr, fr_edition = idx.get_translation("fr", v_start, v_end)
+    return VerseCandidate(
+        ref=_ref(idx, v_start, v_end),
+        ar=arabic,
+        en=en,
+        en_edition=en_edition,
+        fr=fr,
+        fr_edition=fr_edition,
+    )
+
+
+# A numeric reference the user typed next to the quote: «(47:19)», «٤٧: ١٩», «2:255-256».
+_TYPED_REF_RE = re.compile(
+    r"(?<![\d٠-٩])([\d٠-٩]{1,3})\s*:\s*([\d٠-٩]{1,3})(?:\s*[-–]\s*([\d٠-٩]{1,3}))?(?![\d٠-٩])"
+)
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
+def _narrow_by_context(
+    idx: QuranIndex, spans: list[tuple[int, int]], context: QuoteContext
+) -> list[tuple[int, int]]:
+    """The places that the segment's context points to (D-076). A typed ``sura:aya``
+    reference wins; otherwise a word right before or after the quote must be the Quran's own
+    word next to that place. Words that only introduce a verse («قال تعالى») never count.
+    The caller resolves only when exactly one place is left, never by order."""
+    typed = _typed_refs(f"{context.before} {context.after}")
+    if typed:
+        return [span for span in spans if _within_typed(idx, span, typed)]
+    before, after = _context_word(context.before, last=True), _context_word(context.after)
+    if before is None and after is None:
+        return spans
+    kept = []
+    for span in spans:
+        prev_word, next_word = _neighbour_words(idx, span)
+        if (before is not None and before == prev_word) or (
+            after is not None and after == next_word
+        ):
+            kept.append(span)
+    return kept
+
+
+def _typed_refs(text: str) -> list[tuple[int, int, int]]:
+    """``(sura, first aya, last aya)`` for each numeric reference in ``text``."""
+    refs = []
+    for match in _TYPED_REF_RE.finditer(text.translate(_ARABIC_DIGITS)):
+        sura, first = int(match.group(1)), int(match.group(2))
+        last = int(match.group(3)) if match.group(3) else first
+        refs.append((sura, first, max(first, last)))
+    return refs
+
+
+def _within_typed(
+    idx: QuranIndex, span: tuple[int, int], typed: list[tuple[int, int, int]]
+) -> bool:
+    v_start, v_end = idx.verse_range(span)
+    sura = int(idx.verses[v_start]["sura"])
+    first, last = int(idx.verses[v_start]["aya"]), int(idx.verses[v_end]["aya"])
+    return any(s == sura and f <= last and first <= t for s, f, t in typed)
+
+
+def _context_word(text: str, last: bool = False) -> str | None:
+    """The word of ``text`` next to the quote, unless it only introduces a verse."""
+    words = _match_words(VERSE_REF_RE.sub(" ", text))
+    if not words:
+        return None
+    word = words[-1] if last else words[0]
+    return None if _intro_kind(word) is not None else word
+
+
+def _neighbour_words(idx: QuranIndex, span: tuple[int, int]) -> tuple[str | None, str | None]:
+    """The Quran's words right before and after ``span``, inside the same sura."""
+    text = idx.giant_string
+    start = span[0] - 1 if span[0] > 0 and text[span[0] - 1] != " " else span[0]
+    prev_word = next_word = None
+    if start > 1:
+        begin = text.rfind(" ", 0, start - 1) + 1
+        prev_word = _same_sura_word(idx, span, begin, text[begin : start - 1])
+    if span[1] + 1 < len(text):
+        end = text.find(" ", span[1] + 1)
+        next_word = _same_sura_word(idx, span, span[1] + 1, text[span[1] + 1 : end])
+    return prev_word, next_word
+
+
+def _same_sura_word(idx: QuranIndex, span: tuple[int, int], pos: int, word: str) -> str | None:
+    own = idx.verses[idx.char_to_verse_idx[span[0]]]["sura"]
+    return word if word and idx.verses[idx.char_to_verse_idx[pos]]["sura"] == own else None
+
+
+def _without_sura_openings(idx: QuranIndex, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Drop matches that lie inside the basmala opening a sura's first verse in the Tanzil
+    text (112 of them), unless nothing else matched: the basmala quoted alone is 1:1 (or
+    27:30), not the start of every sura."""
+    kept = [span for span in spans if not _in_sura_opening(idx, span)]
+    return kept or spans
+
+
+def _in_sura_opening(idx: QuranIndex, span: tuple[int, int]) -> bool:
+    v_start, v_end = idx.verse_range(span)
+    verse = idx.verses[v_start]
+    opening = verse["aya"] == "1" and verse["ref"] != "1:1"
+    end = idx.verse_offsets[v_start] + len(_BASMALA_TEXT)
+    return (
+        opening and v_start == v_end and verse["norm"].startswith(_BASMALA_TEXT) and span[1] < end
+    )
+
+
+def _verse_share(idx: QuranIndex, v_start: int, v_end: int, matched_chars: int) -> float:
+    """The quote's share of the verses it falls in, by normalized characters; the basmala
+    that opens a sura's first verse in the Tanzil text is not counted («والعصر» is 103:1)."""
+    total = sum(len(idx.verses[i]["norm"]) for i in range(v_start, v_end + 1)) + v_end - v_start
+    if idx.verses[v_start]["norm"].startswith(_BASMALA_TEXT) and idx.verses[v_start]["aya"] == "1":
+        total -= len(_BASMALA_TEXT)
+    return matched_chars / total if total > 0 else 0.0
+
+
+def _reviewed(flags: list[Flag]) -> bool:
+    return any(flag.type != "info" for flag in flags)
 
 
 def _match_words(text: str) -> list[str]:
@@ -429,13 +638,79 @@ _LEAD_WORDS = frozenset(
 )
 
 
-def _unbracketed_candidates(text: str) -> list[list[str]]:
-    """Word runs that may be the verse. A quote in plain brackets or quotation marks is taken
-    as written. Otherwise the text after the attribution formula, minus filler such as
-    «تعالى في كتابه العزيز»; a real word of the quote is never dropped, so a misquote cannot
-    shrink into a match."""
+# Words that introduce a quoted verse (D-051): the segmenter keeps them in the verse's
+# segment, and they are not text the verse's approved translation leaves out.
+_SPEECH_WORDS = frozenset(_match_words("قال يقول قوله لقوله الآية آية"))
+_INTRO_WORDS = _LEAD_WORDS | frozenset(_match_words("الله ربنا كما الكريمة ورد جاء"))
+_CONNECTORS = frozenset(_match_words("و ف ثم أو"))
+_PREFIXES = "وفكل"
+
+VERSE_SPAN_RE = re.compile("﴿[^﴾]*﴾")
+# A sura reference right after a verse: «[البقرة: 153]», «(سورة آل عمران: ٢٠٠)», «(47:19)».
+VERSE_REF_RE = re.compile(
+    r"\s*[\[(]\s*(?:(?:سورة\s+)?[ء-ي\s]{2,30}[:،]|[\d٠-٩]{1,3}\s*:)\s*[\d٠-٩]+"
+    r"(?:\s*[-–]\s*[\d٠-٩]+)?\s*[\])]"
+)
+
+
+def _intro_kind(word: str) -> str | None:
+    """``speech``, ``intro`` or ``connector`` for a word that introduces a verse, else ``None``.
+    ``word`` is in ``_match_words`` form; one attached و/ف/ك/ل is allowed («وقال», «لقوله»)."""
+    for form in (word, word[1:] if len(word) > 1 and word[0] in _PREFIXES else ""):
+        if form in _SPEECH_WORDS:
+            return "speech"
+        if form in _INTRO_WORDS:
+            return "intro"
+    return "connector" if word in _CONNECTORS else None
+
+
+def lead_in_start(text: str) -> int:
+    """Where the words introducing a verse that follows ``text`` begin, or ``len(text)``.
+
+    The lead-in is the longest run of introducing words at the end of ``text``. It counts only
+    with a word of speech («كما قال تعالى:», «الآية») or when it is only connectors («و»), so
+    a sentence that merely ends in «الله» keeps all its words.
+    """
+    start, kinds = len(text), []
+    for match in reversed(list(re.finditer(r"\S+", text))):
+        found = [_intro_kind(word) for word in _match_words(match.group())]
+        if None in found:
+            break
+        kinds += found
+        start = match.start()
+    if "speech" in kinds or (kinds and set(kinds) == {"connector"}):
+        return start
+    return len(text)
+
+
+def has_extra_text(rest: str) -> bool:
+    """``rest`` (the segment without its matched quote) holds words the approved translation
+    does not cover: another verse, or anything but introducing words and a sura reference."""
+    if VERSE_SPAN_RE.search(rest):
+        return True
+    words = _match_words(VERSE_REF_RE.sub(" ", rest))
+    return any(_intro_kind(word) is None for word in words)
+
+
+def _flag_extra_text(result: dict, rest: str) -> dict:
+    """A found verse with other words around it: the output is the verse alone, so the
+    segment is reviewed instead of passing as certain (D-051)."""
+    if result["output"] is not None and has_extra_text(rest):
+        result["flags"].append(Flag(type="warn", key="quran_extra_text"))
+        result["review"] = True
+    return result
+
+
+def _unbracketed_candidates(text: str) -> list[tuple[list[str], QuoteContext]]:
+    """Word runs that may be the verse, each with the text around it. A quote in plain
+    brackets or quotation marks is taken as written. Otherwise the text after the attribution
+    formula, minus filler such as «تعالى في كتابه العزيز»; a real word of the quote is never
+    dropped, so a misquote cannot shrink into a match."""
     quoted = [
-        _match_words(next(group for group in m.groups() if group is not None))
+        (
+            _match_words(next(group for group in m.groups() if group is not None)),
+            QuoteContext(text[: m.start()], text[m.end() :]),
+        )
         for m in _PLAIN_QUOTES.finditer(text)
     ]
     candidates = quoted
@@ -445,49 +720,161 @@ def _unbracketed_candidates(text: str) -> list[list[str]]:
         rest = _match_words(canon[min(ends) :])
         while rest and rest[0] in _LEAD_WORDS:
             rest = rest[1:]
-        candidates = [rest]
+        candidates = [(rest, QuoteContext(canon[: min(canon.find(a) for a in present)]))]
     elif not quoted:
         # No formula, no brackets (D-043): only the whole segment can be the verse.
-        candidates = [_match_words(text)]
-    return [words for words in candidates if len(words) >= UNBRACKETED_MIN_WORDS]
+        candidates = [(_match_words(text), QuoteContext())]
+    return [(words, ctx) for words, ctx in candidates if len(words) >= UNBRACKETED_MIN_WORDS]
 
 
 def _resolve_unbracketed(idx: QuranIndex, text: str, lang: str) -> dict:
-    """Attributed to God without ornate brackets (D-036, D-041): the quote must be a whole-word
-    run of a verse, else nothing is inserted and nothing is translated. No near match: a
-    paraphrase or commentary is never "corrected" into a verse."""
-    for words in _unbracketed_candidates(text):
-        spans = idx.word_spans(words)
+    """Attributed to God or quoted without ornate brackets (D-036, D-041): a whole-word run of
+    a verse gets its approved translation. Otherwise only a near-verse (D-053) may be taken
+    for a misquote and corrected (D-054); a paraphrase or commentary is never "corrected"
+    into a verse, it stays ``output: null`` + review."""
+    uthmani = has_uthmani_marks(text)
+    for words, context in _unbracketed_candidates(uthmani_to_simple(text)):
+        rest = f"{context.before} {context.after}"
+        spans = idx.word_spans(words) or (idx.skeleton_spans(words) if uthmani else [])
+        matched = len(" ".join(words))
+        if not spans:
+            spans = idx.joined_spans(words)
+            matched = spans[0][1] - spans[0][0] if spans else 0
         if spans:
-            return _from_exact(idx, spans, len(" ".join(words)), lang)
+            found = _from_exact(idx, spans, matched, lang, context)
+            return _flag_extra_text(found, rest)
+        if _near_words(idx, words):
+            v_start, v_end, _wrong, span = idx.find_near_words(words)
+            return _flag_extra_text(_misquote_run(idx, lang, v_start, v_end, span), rest)
     return _not_found()
 
 
+def _common_words(left: list[str], right: list[str]) -> int:
+    """Words the two lists share in order (longest common subsequence)."""
+    row = [0] * (len(right) + 1)
+    for word in left:
+        diagonal = 0
+        for j, other in enumerate(right, start=1):
+            diagonal, row[j] = row[j], diagonal + 1 if word == other else max(row[j], row[j - 1])
+    return row[-1]
+
+
+def _run_key(words: list[str], run_words: list[str]) -> tuple[int, int]:
+    """Rank the runs at one place: most of the quote's words kept, then the same length."""
+    return -_common_words(words, run_words), abs(len(run_words) - len(words))
+
+
+def _misquote_run(idx: QuranIndex, lang: str, v_start: int, v_end: int, span) -> dict:
+    """D-007 for a run of words: the correct words with Tanzil's tashkeel when they align."""
+    correct = idx.diacritized_text(span) or idx.giant_string[span[0] : span[1]]
+    return _misquote(idx, lang, (v_start, v_end), _ref(idx, v_start, v_end), correct)
+
+
+def _misquote(
+    idx: QuranIndex, lang: str, verses: tuple[int, int], ref: str, correct_text: str
+) -> dict:
+    """D-007: insert the correct verse's approved translation, block and review."""
+    flags = [Flag(type="block", key="quran_mismatch", detail=f"{ref}|{correct_text}")]
+    output, sources, found_flags = _insert_translation(idx, lang, *verses)
+    return {"output": output, "sources": sources, "flags": flags + found_flags, "review": True}
+
+
+# Persian and Urdu letters a keyboard types for Arabic kaf, ya and ha.
+_PERSIAN_FOLD = str.maketrans("کیہھ", "كيهه")
+
+
+def input_form(text: str) -> str:
+    """The text the Quran matcher reads: NFKC (the ligature «ﷲ», presentation forms) and
+    Persian letters folded. Matching only; the output is the approved translation."""
+    return unicodedata.normalize("NFKC", text).translate(_PERSIAN_FOLD)
+
+
 def resolve_quran(text: str, target_lang: str) -> dict:
+    text = input_form(text)
     idx = get_index()
     quotes = re.findall(r"\uFD3F(.*?)\uFD3E", text)
     if not quotes:
         return _resolve_unbracketed(idx, text, target_lang)
+    context = QuoteContext(text[: match.start()], text[match.end() :])
+    found = _resolve_bracketed(idx, match.group()[1:-1], target_lang, context)
+    return _flag_extra_text(found, f"{context.before} {context.after}")
 
-    query = quotes[0].strip()
+
+def _resolve_bracketed(
+    idx: QuranIndex, quote: str, target_lang: str, context: QuoteContext
+) -> dict:
+    """The quote inside ornate brackets: exact match, else a near match is a misquote (D-007)."""
+    query = uthmani_to_simple(quote).strip()
     query_clean = QURAN_CLEAN_RE.sub("", query)
     query_norm = " ".join(normalize_text(query_clean).split())
 
-    spans = idx.exact_spans(query_norm)
+    # Whole words only (D-052): a quote cut inside a word goes on to the misquote check.
+    spans = [span for span in idx.exact_spans(query_norm) if idx.word_aligned(span)]
+    if not spans and has_uthmani_marks(quote):
+        spans = idx.skeleton_spans(_match_words(query))
+    if not spans:
+        spans = idx.joined_spans(_match_words(query))
     if spans:
-        return _from_exact(idx, spans, len(query_norm), target_lang)
+        matched = len(idx.giant_string[spans[0][0] : spans[0][1]])
+        return _from_exact(idx, spans, matched, target_lang, context)
 
     v_start, v_end, rate = idx.find_near(query_norm)
-    if rate >= NEAR_MAX_RATE:
-        return _not_found()
-    # D-007: insert the correct verse's approved translation, block and review. The correct
-    # verse is shown with Tanzil's tashkeel when it aligns (D-044).
-    correct_text = idx.diacritized_verse(v_start) or idx.verses[v_start]["text"]
-    ref_str = idx.verses[v_start]["ref"]
-    # pass ref and correct_text to detail to fill the placeholders
-    flags = [Flag(type="block", key="quran_mismatch", detail=f"{ref_str}|{correct_text}")]
-    output, sources, found_flags = _insert_translation(idx, target_lang, v_start, v_end)
-    return {"output": output, "sources": sources, "flags": flags + found_flags, "review": True}
+    twins = _identical_verses(idx, v_start)
+    if rate < NEAR_MAX_RATE and len(twins) > 1:
+        # The same words stand in several verses («فبأي آلاء ربكما تكذبان»): no place is
+        # chosen by order (D-076), every place goes to review.
+        return _ambiguous(idx, twins)
+    if rate < NEAR_MAX_RATE:
+        # The correct verse is shown with Tanzil's tashkeel when it aligns (D-044).
+        correct_text = idx.diacritized_verse(v_start) or idx.verses[v_start]["text"]
+        ref = idx.verses[v_start]["ref"]
+        return _misquote(idx, target_lang, (v_start, v_end), ref, correct_text)
+    # A quote spanning verses (D-054).
+    v_start, v_end, rate, span = idx.find_near_run(query_norm.split())
+    if rate < NEAR_MAX_RATE:
+        return _misquote_run(idx, target_lang, v_start, v_end, span)
+    return _not_found()
+
+
+def _identical_verses(idx: QuranIndex, v: int) -> list[tuple[int, int]]:
+    """Whole-verse spans of every verse whose text equals verse ``v``'s, in Quran order."""
+    norm = idx.verses[v]["norm"]
+    return [
+        (idx.verse_offsets[i], idx.verse_offsets[i] + len(norm))
+        for i, verse in enumerate(idx.verses)
+        if verse["norm"] == norm
+    ]
+
+
+# A near-verse (D-053): this many words or more, mostly covered by Quran word windows.
+NEAR_VERSE_MIN_WORDS = 5
+NEAR_VERSE_COVERAGE = 0.75
+
+
+def _near_verse(idx: QuranIndex, words: list[str]) -> bool:
+    """Most words of ``words`` lie in ``BARE_GRAM``-word runs of the Quran (D-053).
+
+    A misquote such as «والعصر ان الانسان لفي صر» has no exact match, yet an LLM given it
+    translates the verse from memory and silently corrects it. The basmala alone does not
+    count: it opens ordinary speech too.
+    """
+    if len(words) < NEAR_VERSE_MIN_WORDS:
+        return False
+    grams = idx.grams()
+    covered = [False] * len(words)
+    for i in range(len(words) - BARE_GRAM + 1):
+        window = tuple(words[i : i + BARE_GRAM])
+        if window in grams and window != _BASMALA:
+            covered[i : i + BARE_GRAM] = [True] * BARE_GRAM
+    return sum(covered) >= NEAR_VERSE_COVERAGE * len(words) or _near_words(idx, words)
+
+
+def _near_words(idx: QuranIndex, words: list[str]) -> bool:
+    """One wrong word in four at most (and at least one) against an aligned Quran run (D-054):
+    a misquote with a wrong word in the middle is still a verse, not speech."""
+    if len(words) < NEAR_VERSE_MIN_WORDS:
+        return False
+    return idx.find_near_words(words)[2] <= max(1, len(words) // 4)
 
 
 def contains_bare_verse(text: str) -> bool:
@@ -496,7 +883,8 @@ def contains_bare_verse(text: str) -> bool:
     and no brackets. Such text must never reach the LLM: the Quran handler inserts the
     approved translation or sends it to review."""
     idx = get_index()
-    words = _match_words(text)
+    text = input_form(text)
+    words = _match_words(uthmani_to_simple(text))
     if idx.has_grams(words) and idx.find_words(words):
         return True
     if len(words) == UNBRACKETED_MIN_WORDS and len(idx.find_words(words)) == 1:
