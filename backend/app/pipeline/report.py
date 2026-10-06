@@ -23,6 +23,8 @@ _SINGLE_PLACEHOLDER = {
     "term_check_failed": "term",
     "quran_ambiguous": "refs",
     "quran_context_resolved": "ref",
+    "hadith_corpus_match": "refs",
+    "hadith_corpus_ambiguous": "refs",
 }
 
 _UNFILLED_RE = re.compile(r"\{[a-z_]+\}")
@@ -55,6 +57,9 @@ def _placeholders(flag: Flag) -> dict[str, str]:
     if flag.key == "quran_diacritized":
         ref, _, verse = flag.detail.partition("|")
         return {"ref": ref, "verse": verse}
+    if flag.key == "hadith_corpus_partial":
+        refs, _, completion = flag.detail.partition("|")
+        return {"refs": refs, "completion": completion}
     if flag.key in ("avoid_word_found", "compare_why_term"):
         term, _, word = flag.detail.partition("|")
         return {"term": term, "word": word}
